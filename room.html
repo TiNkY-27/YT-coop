@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sala - YouTube Music Sync</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class'
+    };
+  </script>
+  <style>
+    /* Aspect ratio helper */
+    .aspect-video { aspect-ratio: 16 / 9; }
+    /* Range thumb colors that follow theme */
+    input[type="range"] { accent-color: #111827; }
+    .dark input[type="range"] { accent-color: #f3f4f6; }
+    /* Player iframe container */
+    #player-container { position: relative; width: 100%; }
+    #player-container iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+
+    /* ===== Items generados por JS (renderQueue) ===== */
+    .queue-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+    .queue-list .queue-item {
+      display: flex; align-items: center; gap: 0.5rem;
+      padding: 0.5rem 0.75rem; border-radius: 0.5rem;
+    }
+    .queue-list .queue-item.is-active {
+      background-color: #f3f4f6;
+    }
+    .dark .queue-list .queue-item.is-active {
+      background-color: #1f2937;
+    }
+    .queue-list .queue-item .qi-icon {
+      width: 1.25rem; height: 1.25rem; flex-shrink: 0;
+      color: #9ca3af;
+    }
+    .queue-list .queue-item.is-active .qi-icon { color: #111827; }
+    .dark .queue-list .queue-item .qi-icon { color: #6b7280; }
+    .dark .queue-list .queue-item.is-active .qi-icon { color: #f3f4f6; }
+    .queue-list .queue-item .qi-name {
+      font-size: 0.875rem; color: #111827; font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
+    }
+    .dark .queue-list .queue-item .qi-name { color: #f3f4f6; }
+    .queue-list .queue-item .qi-sub {
+      font-size: 0.75rem; color: #9ca3af;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%;
+    }
+    .dark .queue-list .queue-item .qi-sub { color: #6b7280; }
+    .queue-list .queue-empty {
+      padding: 0.75rem; text-align: center; font-size: 0.8rem;
+      color: #9ca3af;
+    }
+    .dark .queue-list .queue-empty { color: #6b7280; }
+
+    /* ===== Participants (oculto, lo usa JS como cache) ===== */
+    .participants { list-style: none; margin: 0; padding: 0; display: none; }
+
+    /* Asegurar que hidden gane sobre flex en admin-panel */
+    #admin-panel.hidden { display: none !important; }
+    #admin-panel:not(.hidden) { display: flex !important; }
+    #preview-box.hidden { display: none !important; }
+    #now-playing.hidden { display: none !important; }
+    /* mode-display oculto si sos admin (ahi se ve el admin-panel) */
+    body.is-admin #mode-display { display: none; }
+    body:not(.is-admin) #admin-panel { display: none !important; }
+  </style>
+</head>
+<body class="min-h-screen bg-white text-gray-900 antialiased dark:bg-gray-950 dark:text-gray-100">
+
+  <!-- Wrapper principal -->
+  <div class="mx-auto min-h-screen max-w-lg p-5">
+
+    <!-- ===== 2. Barra superior ===== -->
+    <div class="mb-5 flex items-center justify-between">
+      <div class="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+        <span id="live-dot" class="inline-block h-2 w-2 rounded-full bg-emerald-500"></span>
+        <span>Sala <span id="room-code" class="font-mono font-semibold text-gray-700 dark:text-gray-300">--</span> · <span id="participants-count">0</span> conectados</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="theme-toggle" type="button" aria-label="Cambiar tema"
+          class="inline-flex h-8 w-8 items-center justify-center rounded-full text-gray-500 transition hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800">
+          <svg id="icon-sun" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+          <svg id="icon-moon" xmlns="http://www.w3.org/2000/svg" class="hidden h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <div id="admin-panel" class="hidden items-center gap-2 rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+          <span class="font-medium">Modo:</span>
+          <span id="mode-text-admin">Abierto</span>
+          <label class="relative inline-block cursor-pointer">
+            <input id="mode-toggle" type="checkbox" class="peer sr-only">
+            <span class="block h-4 w-7 rounded-full bg-gray-300 transition peer-checked:bg-gray-900 dark:bg-gray-600 dark:peer-checked:bg-white"></span>
+            <span class="absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-white transition peer-checked:translate-x-3 dark:bg-gray-900 dark:peer-checked:bg-gray-950"></span>
+          </label>
+        </div>
+        <div id="mode-display" class="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+          <span class="font-medium">Modo:</span> <span id="mode-text">Abierto</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 3. Tarjeta del reproductor ===== -->
+    <div class="relative mb-4 overflow-hidden rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
+      <div id="player-container" class="aspect-video bg-gray-100 dark:bg-gray-950"></div>
+      <div id="resume-overlay" class="hidden absolute inset-0 flex cursor-pointer items-center justify-center bg-black/40" role="button" tabindex="0" aria-label="Reanudar reproducción">
+        <div class="flex items-center gap-2 rounded-full bg-white px-5 py-2.5 text-sm font-semibold text-gray-900 shadow-lg">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          Reanudar
+        </div>
+      </div>
+      <div class="p-3">
+        <h2 id="current-info" class="truncate text-base font-medium text-gray-900 dark:text-gray-100">Sin canciones en la cola</h2>
+        <p id="now-playing" class="truncate text-sm text-gray-500 dark:text-gray-400">Agregá una playlist o un video para empezar.</p>
+        <p id="room-title" class="hidden"></p>
+      </div>
+    </div>
+
+    <!-- ===== 4. Barra de progreso ===== -->
+    <div class="mb-3">
+      <input id="progress" type="range" min="0" max="0" value="0" disabled
+        class="w-full disabled:cursor-not-allowed disabled:opacity-30">
+      <div class="mt-1 flex justify-between text-xs text-gray-400">
+        <span id="progress-current">0:00</span>
+        <span id="progress-total">0:00</span>
+      </div>
+    </div>
+
+    <!-- ===== 5. Controles ===== -->
+    <div class="mb-4 flex items-center justify-center gap-5">
+      <button id="prev-btn" type="button" aria-label="Anterior" disabled
+        class="text-gray-500 transition hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-30 dark:text-gray-400 dark:hover:text-gray-100">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zM9.5 12l8.5 6V6z"/></svg>
+      </button>
+      <button id="play-btn" type="button" aria-label="Reproducir" disabled
+        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-gray-900 text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-30 dark:bg-white dark:text-gray-900 dark:hover:bg-gray-200">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+      <button id="pause-btn" type="button" aria-label="Pausar" disabled
+        class="text-gray-500 transition hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-30 dark:text-gray-400 dark:hover:text-gray-100">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
+      </button>
+      <button id="next-btn" type="button" aria-label="Siguiente" disabled
+        class="text-gray-500 transition hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-30 dark:text-gray-400 dark:hover:text-gray-100">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" viewBox="0 0 24 24" fill="currentColor"><path d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg>
+      </button>
+      <button id="sync-btn" type="button" aria-label="Sincronizar" disabled
+        class="ml-2 text-gray-500 transition hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-30 dark:text-gray-400 dark:hover:text-gray-100"
+        title="Sincronizar">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4v5h.582M19.418 15A8.003 8.003 0 014 12m16 8v-5h-.581M4.582 9A8.003 8.003 0 0120 12"/></svg>
+      </button>
+      <span id="player-controls" class="hidden"></span>
+      <div id="progress-row" class="hidden"></div>
+    </div>
+
+    <!-- Volumen -->
+    <div id="volume-row" class="mb-4 flex items-center gap-2">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 flex-shrink-0 text-gray-500 dark:text-gray-400" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 00-2.5-4.03v8.06A4.5 4.5 0 0016.5 12z"/></svg>
+      <input id="volume" type="range" min="0" max="100" value="100" disabled
+        class="w-full disabled:cursor-not-allowed disabled:opacity-30">
+      <span id="volume-value" class="w-8 text-right font-mono text-xs tabular-nums text-gray-400">100</span>
+    </div>
+
+    <!-- ===== 6. Buscador de playlist ===== -->
+    <div class="mb-4 flex gap-2">
+      <input id="playlist-url" type="text" placeholder="Pegá el link de una playlist o un video…"
+        class="flex-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 placeholder-gray-400 focus:border-gray-900 focus:outline-none focus:ring-1 focus:ring-gray-900 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-white dark:focus:ring-white">
+      <button id="add-to-queue" type="button" disabled
+        class="rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white dark:text-gray-900 dark:hover:bg-gray-200">
+        Añadir
+      </button>
+      <button id="share-btn" type="button" class="hidden rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-gray-900">Copiar</button>
+      <input id="username-input" type="text" maxlength="20" placeholder="Tu nombre" class="hidden">
+    </div>
+
+    <div id="preview-box" class="hidden mb-4 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-900">
+      <div class="flex items-center gap-3">
+        <div class="preview-thumb h-12 w-20 flex-shrink-0 rounded-md bg-gray-100 bg-cover bg-center dark:bg-gray-800"></div>
+        <div class="preview-info min-w-0 flex-1">
+          <strong id="preview-name" class="block truncate text-sm font-medium text-gray-900 dark:text-gray-100"></strong>
+          <span id="preview-id" class="block truncate font-mono text-xs text-gray-500 dark:text-gray-400"></span>
+        </div>
+      </div>
+      <div class="mt-3 flex gap-2">
+        <button id="save-to-profile" type="button"
+          class="flex-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-medium text-gray-700 transition hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300 dark:hover:bg-gray-800">
+          Guardar en mi perfil
+        </button>
+      </div>
+    </div>
+
+    <!-- ===== 7. En cola ===== -->
+    <div class="mb-4">
+      <h3 class="mb-2 text-xs uppercase tracking-wide text-gray-400">En cola</h3>
+      <ul id="queue-list" class="queue-list"></ul>
+    </div>
+
+    <!-- Elementos auxiliares usados por JS (ocultos visualmente) -->
+    <ul id="participants-list" class="participants"></ul>
+    <select id="saved-playlists" class="hidden"><option value="">Selecciona una playlist guardada...</option></select>
+    <button id="load-saved-btn" type="button" class="hidden">Agregar a la cola</button>
+    <p id="status-message" class="mt-2 min-h-[1rem] text-center text-xs text-gray-400"></p>
+  </div>
+
+  <script src="js/supabase-client.js" type="module"></script>
+  <script src="js/config.js" type="module"></script>
+  <script src="js/yt-api.js" type="module"></script>
+  <script src="js/player.js" type="module"></script>
+  <script src="js/room.js" type="module"></script>
+</body>
+</html>

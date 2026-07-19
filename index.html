@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Music Sync</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 antialiased">
+  <main class="flex min-h-screen flex-col items-center justify-center px-4 py-10 text-center">
+    <div class="mb-8 max-w-md">
+      <div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-red-500 to-rose-600 shadow-lg shadow-rose-500/20">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-white" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M8 5v14l11-7z"/>
+        </svg>
+      </div>
+      <h1 class="text-3xl font-bold tracking-tight text-slate-100 sm:text-4xl">YouTube Music Sync</h1>
+      <p class="mt-2 text-slate-400">Escuchá playlists de YouTube en salas compartidas, en simultáneo con tus amigos.</p>
+    </div>
+
+    <section class="w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-800 p-6 shadow-xl shadow-black/40">
+      <div class="space-y-4">
+        <div>
+          <label for="username" class="mb-2 block text-sm font-medium text-slate-300">Tu nombre</label>
+          <input id="username" type="text" placeholder="Anonimo" maxlength="20"
+            class="w-full rounded-lg border border-slate-700 bg-slate-900 px-4 py-2.5 text-slate-100 placeholder-slate-500 focus:border-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500/40">
+        </div>
+
+        <button id="create-room"
+          class="w-full rounded-lg bg-rose-600 px-4 py-2.5 font-semibold text-white shadow-sm transition hover:bg-rose-500 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50">
+          Crear sala
+        </button>
+
+        <div class="flex items-center gap-3 text-xs uppercase tracking-wide text-slate-500">
+          <span class="h-px flex-1 bg-slate-700"></span>
+          <span>o unite con un código</span>
+          <span class="h-px flex-1 bg-slate-700"></span>
+        </div>
+
+        <div>
+          <input id="join-code" type="text" placeholder="Ej: ABC123" maxlength="10"
+            class="w-full rounded-lg border border-slate-700 bg-slate-900 px-4 py-2.5 text-center font-mono text-lg tracking-widest text-slate-100 placeholder-slate-500 focus:border-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500/40">
+        </div>
+
+        <button id="join-room"
+          class="w-full rounded-lg border border-slate-600 bg-slate-700 px-4 py-2.5 font-semibold text-slate-100 transition hover:bg-slate-600 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50">
+          Unirse a sala
+        </button>
+
+        <p id="status" class="min-h-[1.25rem] pt-1 text-sm text-slate-400"></p>
+      </div>
+    </section>
+  </main>
+
+  <script src="js/supabase-client.js" type="module"></script>
+  <script src="js/index.js" type="module"></script>
+</body>
+</html>
