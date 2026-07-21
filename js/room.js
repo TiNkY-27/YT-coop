@@ -1,3 +1,4 @@
+console.log('ROOM.JS CARGADO - VERSION TEST - build 2025');
 let supabase = null;
 const Player = window.Player;
 let userId = null;
