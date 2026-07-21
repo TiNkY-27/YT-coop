@@ -13,9 +13,19 @@ let lastVideoId = null;
 // Identificador unico de este cliente/pestana. Se incluye en cada emit para
 // que el receptor pueda distinguir eco propio (mismo clientId) de un evento
 // genuino de otro participante (distinto clientId), sin importar el tiempo.
-const CLIENT_ID = (typeof crypto !== 'undefined' && crypto.randomUUID)
-  ? crypto.randomUUID()
-  : 'c_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+// Se persiste en sessionStorage para que sobreviva a re-inicializaciones
+// del modulo (reconexion de Realtime, etc.) durante la vida de la pestaña.
+const CLIENT_ID = (function () {
+  try {
+    const stored = sessionStorage.getItem('ytsync_client_id');
+    if (stored) return stored;
+  } catch (e) {}
+  const fresh = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'c_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  try { sessionStorage.setItem('ytsync_client_id', fresh); } catch (e) {}
+  return fresh;
+})();
 let stateTimer = null;
 let progressTimer = null;
 let previewKind = null;
@@ -629,20 +639,31 @@ function scheduleSettleCheck() {
       s === YT.PlayerState.ENDED ? 'ended' :
       null;
 
+    // La fuente de verdad es SIEMPRE room.player_state (lo que el remoto acaba de establecer).
+    // El player local puede estar en transicion/buffering; lo que nunca debemos hacer es
+    // pisar el estado remoto emitiendo un nuevo valor.
+    const targetState = room.player_state;
+
     console.log('[SYNC][SETTLE]', {
       finalPlayerState: playerStateName,
-      remoteState: room.player_state,
-      match: playerStateName === room.player_state
+      remoteState: targetState,
+      match: playerStateName === targetState
     });
 
-    // Si el player quedo en un estado distinto al que se aplico,
-    // emitimos el estado real para corregir la sala.
-    if (playerStateName && playerStateName !== room.player_state && playerStateName !== 'ended') {
-      console.log('[SYNC][SETTLE][CORRECT]', {
-        from: room.player_state,
-        to: playerStateName
+    // Si el player quedo en un estado distinto al que se aplico (porque estaba en buffering
+    // o transicion), forzamos al player local a igualar el estado remoto. NUNCA emitimos
+    // a la base de datos para "corregir" el remoto con el estado local.
+    if (playerStateName && targetState && playerStateName !== targetState) {
+      console.log('[SYNC][SETTLE][FORCE-LOCAL]', {
+        playerState: playerStateName,
+        targetState: targetState,
+        action: targetState === 'playing' ? 'Player.play()' : 'Player.pause()'
       });
-      emitRoomState(playerStateName);
+      if (targetState === 'playing' && s !== YT.PlayerState.PLAYING) {
+        Player.play();
+      } else if (targetState === 'paused' && s !== YT.PlayerState.PAUSED) {
+        Player.pause();
+      }
     }
   }, SETTLE_WINDOW_MS);
 }
@@ -1165,7 +1186,7 @@ function bindUI() {
   if (els.playBtn) {
     els.playBtn.addEventListener('click', function () {
       if (!canControl || !hasQueue) return;
-      emitRoomState('playing');
+      emitRoomState('playing', { __userAction: true });
       Player.play();
     });
   }
@@ -1173,7 +1194,7 @@ function bindUI() {
   if (els.pauseBtn) {
     els.pauseBtn.addEventListener('click', function () {
       if (!canControl || !hasQueue) return;
-      emitRoomState('paused');
+      emitRoomState('paused', { __userAction: true });
       Player.pause();
     });
   }
