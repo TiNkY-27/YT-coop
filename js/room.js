@@ -1,4 +1,3 @@
-console.log('ROOM.JS CARGADO - VERSION TEST - build 2025');
 let supabase = null;
 const Player = window.Player;
 let userId = null;
@@ -23,9 +22,10 @@ let currentVolume = 100;
 let lastAppliedAt = 0;            // timestamp (ms) del ultimo estado aplicado localmente (propio o remoto)
 let lastSentPlaybackTime = 0;     // ultimo playback_time que mande a DB
 let applyingRemote = false;       // true mientras aplicamos un sync remoto (evita eco)
-let suppressPlayUntil = 0;        // timestamp hasta el cual ignoramos PLAYING espontaneos
-const REMOTE_STATE_GRACE_MS = 100;   // tolerancia para syncs que llegan casi al mismo tiempo
-const SUPPRESS_PLAY_AFTER_PAUSE_MS = 5000;  // ventana donde ignoramos PLAYING post-pause
+let settleUntil = 0;              // ventana de asentamiento: durante este tiempo suprimimos emisiones
+let settleTimer = null;           // timer que ejecuta el check post-asentamiento
+const REMOTE_STATE_GRACE_MS = 100;        // tolerancia para syncs que llegan casi al mismo tiempo
+const SETTLE_WINDOW_MS = 600;             // ventana donde ignoramos transiciones intermedias del player
 
 const els = {};
 
@@ -570,15 +570,54 @@ function applyRemoteState(newRoom) {
       Player.play();
     } else if (newRoom.player_state === 'paused' && state === YT.PlayerState.PLAYING) {
       Player.pause();
-      // Ventana de proteccion contra autoresume del player remoto.
-      suppressPlayUntil = Date.now() + SUPPRESS_PLAY_AFTER_PAUSE_MS;
     }
   } finally {
-    applyingRemote = false;
+    // Mantenemos applyingRemote hasta que termine la ventana de asentamiento
+    // para que los rebotes intermedios del IFrame Player (BUFFERING/PLAYING/PAUSED)
+    // NO generen eco.
+    settleUntil = Date.now() + SETTLE_WINDOW_MS;
+    scheduleSettleCheck();
   }
 
   updateNowPlaying();
   updateProgress();
+}
+
+// Despues de aplicar un estado remoto, esperamos a que el player se asiente.
+// Si al final de la ventana el estado del player coincide con el aplicado, no emitimos.
+// Si quedo en un estado distinto al que mandaron, emitimos ese estado "firme".
+function scheduleSettleCheck() {
+  if (settleTimer) clearTimeout(settleTimer);
+  settleTimer = setTimeout(function () {
+    settleTimer = null;
+    applyingRemote = false;
+    settleUntil = 0;
+
+    if (!Player.isReady() || !room) return;
+
+    const s = Player.getState();
+    const playerStateName =
+      s === YT.PlayerState.PLAYING ? 'playing' :
+      s === YT.PlayerState.PAUSED ? 'paused' :
+      s === YT.PlayerState.ENDED ? 'ended' :
+      null;
+
+    console.log('[SYNC][SETTLE]', {
+      finalPlayerState: playerStateName,
+      remoteState: room.player_state,
+      match: playerStateName === room.player_state
+    });
+
+    // Si el player quedo en un estado distinto al que se aplico,
+    // emitimos el estado real para corregir la sala.
+    if (playerStateName && playerStateName !== room.player_state && playerStateName !== 'ended') {
+      console.log('[SYNC][SETTLE][CORRECT]', {
+        from: room.player_state,
+        to: playerStateName
+      });
+      emitRoomState(playerStateName);
+    }
+  }, SETTLE_WINDOW_MS);
 }
 
 // Aplica solo la metadata al objeto room local (sin tocar el reproductor).
@@ -700,9 +739,9 @@ function onPlayerStateChange(stateCode) {
     stateCode: stateCode,
     ignoringEvents: ignoringEvents(),
     applyingRemote: applyingRemote,
-    suppressPlayUntil: suppressPlayUntil,
+    settleUntil: settleUntil,
     nowMs: Date.now(),
-    inSuppressWindow: Date.now() < suppressPlayUntil
+    inSettleWindow: Date.now() < settleUntil
   });
 
   if (ignoringEvents()) return;
@@ -712,26 +751,16 @@ function onPlayerStateChange(stateCode) {
     : stateCode === YT.PlayerState.ENDED ? 'ended'
     : null;
 
-  // Si estamos aplicando un sync remoto, los onStateChange que dispara el
-  // Player.play()/pause() NO deben generar eco.
-  if (applyingRemote) {
-    console.log('[SYNC][ONSTATE][SKIP-REMOTE]', { state: stateName });
-    if (name === 'ended' && canControl) {
-      advanceQueue();
-    }
-    updateNowPlaying();
-    return;
-  }
-
-  // Suprimir PLAYING espontaneos: si acabamos de pausar (propio o remoto) y
-  // YouTube se autorreanuda (típico tras buffering o seek), lo silenciamos
-  // durante una ventana corta para no pisar el pause.
-  if (stateCode === YT.PlayerState.PLAYING && Date.now() < suppressPlayUntil) {
-    console.log('[SYNC][ONSTATE][SUPPRESS-PLAY]', {
-      remaining: suppressPlayUntil - Date.now()
+  // Si estamos aplicando un sync remoto O dentro de la ventana de asentamiento,
+  // suprimimos TODAS las emisiones. El IFrame Player rebota BUFFERING/PLAYING/PAUSED
+  // al pausar/seekear; cualquier emision durante esa secuencia genera eco.
+  if (applyingRemote || Date.now() < settleUntil) {
+    console.log('[SYNC][ONSTATE][SUPPRESS]', {
+      reason: applyingRemote ? 'applyingRemote' : 'settleWindow',
+      state: stateName
     });
-    if (Player.isReady()) {
-      Player.pause();
+    if (name === 'ended' && canControl && !applyingRemote) {
+      advanceQueue();
     }
     updateNowPlaying();
     return;
@@ -739,8 +768,9 @@ function onPlayerStateChange(stateCode) {
 
   if (name === 'playing' || name === 'paused') {
     if (name === 'paused') {
-      // Apenas pausamos, abrimos la ventana donde rechazamos PLAYING espontaneo.
-      suppressPlayUntil = Date.now() + SUPPRESS_PLAY_AFTER_PAUSE_MS;
+      // Abrimos ventana corta para que cualquier rebote BUFFERING/PLAYING
+      // post-pause no reemita.
+      settleUntil = Date.now() + SETTLE_WINDOW_MS;
     }
     console.log('[SYNC][ONSTATE][EMIT-VIA]', { state: stateName });
     emitRoomState(name);
