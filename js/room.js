@@ -9,6 +9,13 @@ let canControl = false;
 let hasQueue = false;
 let lastSentUpdatedAt = null;
 let lastVideoId = null;
+
+// Identificador unico de este cliente/pestana. Se incluye en cada emit para
+// que el receptor pueda distinguir eco propio (mismo clientId) de un evento
+// genuino de otro participante (distinto clientId), sin importar el tiempo.
+const CLIENT_ID = (typeof crypto !== 'undefined' && crypto.randomUUID)
+  ? crypto.randomUUID()
+  : 'c_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 let stateTimer = null;
 let progressTimer = null;
 let previewKind = null;
@@ -21,6 +28,7 @@ let currentVolume = 100;
 // === Sync / state control ===
 let lastAppliedAt = 0;            // timestamp (ms) del ultimo estado aplicado localmente (propio o remoto)
 let lastSentPlaybackTime = 0;     // ultimo playback_time que mande a DB
+let lastSentClientId = null;      // ultimo client_id que mande a DB (para deteccion de eco)
 let applyingRemote = false;       // true mientras aplicamos un sync remoto (evita eco)
 let settleUntil = 0;              // ventana de asentamiento: durante este tiempo suprimimos emisiones
 let settleTimer = null;           // timer que ejecuta el check post-asentamiento
@@ -405,6 +413,7 @@ async function emitRoomState(playerState, extra) {
     ms: nowMs,
     caller: callerStack,
     state: finalState,
+    clientId: CLIENT_ID,
     videoId: Player.getVideoId(),
     playbackTime: finalTime,
     extra: extra
@@ -414,11 +423,13 @@ async function emitRoomState(playerState, extra) {
     playback_time: finalTime,
     player_state: finalState,
     current_video_id: Player.getVideoId(),
+    client_id: CLIENT_ID,
     updated_at: nowIso,
     ...extra
   };
 
   lastSentUpdatedAt = patch.updated_at;
+  lastSentClientId = CLIENT_ID;
   lastSentPlaybackTime = patch.playback_time;
   lastAppliedAt = nowMs;
 
@@ -500,16 +511,19 @@ function applyRemoteState(newRoom) {
 
   const remoteMs = newRoom.updated_at ? new Date(newRoom.updated_at).getTime() : 0;
 
-  // Eco: si lo mandamos nosotros hace poco, ignorar (ventana chica).
-  const isEcho = lastSentUpdatedAt && newRoom.updated_at &&
-    Math.abs(remoteMs - new Date(lastSentUpdatedAt).getTime()) < 250;
+  // Eco: solo si el client_id del remitente coincide con el mio.
+  // Ya no usamos cercania de tiempo como criterio principal: si el otro
+  // participante actua casi al mismo tiempo, su evento es genuino y no debe
+  // descartarse solo por proximidad temporal.
+  const isEcho = newRoom.client_id && newRoom.client_id === CLIENT_ID;
   if (isEcho) {
     console.log('[SYNC][RECV][DROP-ECHO]', {
       remoteState: newRoom.player_state,
       remoteUpdatedAt: newRoom.updated_at,
       remoteMs: remoteMs,
-      lastSentUpdatedAt: lastSentUpdatedAt,
-      lastAppliedAt: lastAppliedAt
+      remoteClientId: newRoom.client_id,
+      lastAppliedAt: lastAppliedAt,
+      reason: 'same client_id'
     });
     return;
   }
@@ -532,6 +546,7 @@ function applyRemoteState(newRoom) {
     remoteState: newRoom.player_state,
     remoteUpdatedAt: newRoom.updated_at,
     remoteMs: remoteMs,
+    remoteClientId: newRoom.client_id,
     lastAppliedAt: lastAppliedAt,
     currentPlayerState: Player.getState(),
     applyingRemote: applyingRemote

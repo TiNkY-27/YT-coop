@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   current_queue_index INTEGER DEFAULT 0,
   playback_time DOUBLE PRECISION DEFAULT 0,
   player_state TEXT DEFAULT 'paused',
+  client_id TEXT,
   active BOOLEAN NOT NULL DEFAULT true,
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
