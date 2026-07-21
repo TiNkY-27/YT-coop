@@ -493,6 +493,10 @@ async function advanceQueue() {
   const idx = (room.current_queue_index || 0) + 1;
   const nextItem = queueCache[idx];
 
+  // Abrimos ventana de asentamiento para evitar eco de los rebotes del player.
+  settleUntil = Date.now() + SETTLE_WINDOW_MS;
+  suppressPlayerEvents(SETTLE_WINDOW_MS);
+
   if (!nextItem) {
     Player.stop();
     await supabase.from('rooms').update({
@@ -500,21 +504,23 @@ async function advanceQueue() {
       current_queue_index: 0,
       playback_time: 0,
       player_state: 'paused',
+      client_id: CLIENT_ID,
       updated_at: new Date().toISOString()
     }).eq('id', room.id);
     return;
   }
+
+  Player.loadVideo(nextItem.video_id, 0);
+  Player.play();
 
   await supabase.from('rooms').update({
     current_video_id: nextItem.video_id,
     current_queue_index: idx,
     playback_time: 0,
     player_state: 'playing',
+    client_id: CLIENT_ID,
     updated_at: new Date().toISOString()
   }).eq('id', room.id);
-
-  Player.loadVideo(nextItem.video_id, 0);
-  Player.play();
 }
 
 function applyRemoteState(newRoom) {
@@ -807,9 +813,6 @@ function onPlayerStateChange(stateCode) {
       reason: applyingRemote ? 'applyingRemote' : 'settleWindow',
       state: stateName
     });
-    if (name === 'ended' && canControl && !applyingRemote) {
-      advanceQueue();
-    }
     updateNowPlaying();
     return;
   }
@@ -827,8 +830,10 @@ function onPlayerStateChange(stateCode) {
     emitRoomState(name, { __userAction: true });
   }
 
-  if (name === 'ended' && canControl) {
-    // Video terminado: avanzar al siguiente item de la cola.
+  // 'ended' lo maneja SOLO el admin para evitar carrera entre clientes
+  // que terminan su reproductor local casi al mismo tiempo.
+  if (name === 'ended' && isAdmin) {
+    console.log('[SYNC][ONSTATE][ADMIN-ADVANCE]');
     advanceQueue();
   }
 
@@ -1078,19 +1083,20 @@ async function getNextPosition() {
 
 async function startQueueAt(position, firstRow) {
   const idx = queueCache.length; // sera el primer item nuevo
-  const { data: updatedRoom, error: roomErr } = await supabase.from('rooms').update({
+  // Abrimos ventana de asentamiento ANTES de tocar el player.
+  settleUntil = Date.now() + SETTLE_WINDOW_MS;
+  suppressPlayerEvents(SETTLE_WINDOW_MS);
+  Player.loadVideo(firstRow.video_id, 0);
+  Player.play();
+  // Escribimos a DB con client_id (el sync que vuelva sera DROP-ECHO).
+  await supabase.from('rooms').update({
     current_video_id: firstRow.video_id,
     current_queue_index: idx,
     playback_time: 0,
     player_state: 'playing',
+    client_id: CLIENT_ID,
     updated_at: new Date().toISOString()
-  }).eq('id', room.id).select().single();
-
-  if (roomErr) console.warn('Error actualizando sala:', roomErr.message);
-  if (updatedRoom) Object.assign(room, updatedRoom);
-
-  Player.loadVideo(firstRow.video_id, 0);
-  Player.play();
+  }).eq('id', room.id);
 }
 
 async function savePreviewToProfile() {
@@ -1205,18 +1211,22 @@ function bindUI() {
       const idx = (room.current_queue_index || 0) - 1;
       const target = queueCache[idx];
       if (!target) return;
-      suppressPlayerEvents(1000);
-      (async function () {
-        await supabase.from('rooms').update({
-          current_video_id: target.video_id,
-          current_queue_index: idx,
-          playback_time: 0,
-          player_state: 'playing',
-          updated_at: new Date().toISOString()
-        }).eq('id', room.id);
-      })();
+      // Abrimos ventana de asentamiento ANTES de tocar el player, para que
+      // los onStateChange que genere no disparen emitRoomState y el sync que
+      // vuelva por Realtime sea DROP-ECHO.
+      settleUntil = Date.now() + SETTLE_WINDOW_MS;
+      suppressPlayerEvents(SETTLE_WINDOW_MS);
       Player.loadVideo(target.video_id, 0);
       Player.play();
+      // Escribimos a DB con client_id para que el receptor sepa que es nuestro.
+      supabase.from('rooms').update({
+        current_video_id: target.video_id,
+        current_queue_index: idx,
+        playback_time: 0,
+        player_state: 'playing',
+        client_id: CLIENT_ID,
+        updated_at: new Date().toISOString()
+      }).eq('id', room.id);
     });
   }
 
@@ -1226,18 +1236,18 @@ function bindUI() {
       const idx = (room.current_queue_index || 0) + 1;
       const target = queueCache[idx];
       if (!target) return;
-      suppressPlayerEvents(1000);
-      (async function () {
-        await supabase.from('rooms').update({
-          current_video_id: target.video_id,
-          current_queue_index: idx,
-          playback_time: 0,
-          player_state: 'playing',
-          updated_at: new Date().toISOString()
-        }).eq('id', room.id);
-      })();
+      settleUntil = Date.now() + SETTLE_WINDOW_MS;
+      suppressPlayerEvents(SETTLE_WINDOW_MS);
       Player.loadVideo(target.video_id, 0);
       Player.play();
+      supabase.from('rooms').update({
+        current_video_id: target.video_id,
+        current_queue_index: idx,
+        playback_time: 0,
+        player_state: 'playing',
+        client_id: CLIENT_ID,
+        updated_at: new Date().toISOString()
+      }).eq('id', room.id);
     });
   }
 
