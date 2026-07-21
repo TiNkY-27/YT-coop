@@ -7,14 +7,12 @@ let room = null;
 let isAdmin = false;
 let canControl = false;
 let hasQueue = false;
-let lastSentUpdatedAt = null;
 let lastVideoId = null;
 
-// Identificador unico de este cliente/pestana. Se incluye en cada emit para
-// que el receptor pueda distinguir eco propio (mismo clientId) de un evento
-// genuino de otro participante (distinto clientId), sin importar el tiempo.
-// Se persiste en sessionStorage para que sobreviva a re-inicializaciones
-// del modulo (reconexion de Realtime, etc.) durante la vida de la pestaña.
+// Identificador unico de este cliente/pestana. Se incluye en cada emit a
+// Supabase para registro/trazabilidad, pero YA NO se usa para descartar eco:
+// todo el flujo de aplicacion pasa por un unico camino (renderRoomState) sin
+// importar de quien provenga el cambio.
 const CLIENT_ID = (function () {
   try {
     const stored = sessionStorage.getItem('ytsync_client_id');
@@ -36,15 +34,12 @@ let themeIsDark = false;
 let currentVolume = 100;
 
 // === Sync / state control ===
-let lastAppliedAt = 0;            // timestamp (ms) del ultimo estado que el player local aplico (REMOTO o ACCION DE USUARIO). NO se actualiza por heartbeats.
-let lastEmittedAt = 0;            // timestamp (ms) del ultimo estado que mande a DB (incluye heartbeats)
-let lastSentPlaybackTime = 0;     // ultimo playback_time que mande a DB
-let lastSentClientId = null;      // ultimo client_id que mande a DB (para deteccion de eco)
-let applyingRemote = false;       // true mientras aplicamos un sync remoto (evita eco)
-let settleUntil = 0;              // ventana de asentamiento: durante este tiempo suprimimos emisiones
-let settleTimer = null;           // timer que ejecuta el check post-asentamiento
-const REMOTE_STATE_GRACE_MS = 100;        // tolerancia para syncs que llegan casi al mismo tiempo
-const SETTLE_WINDOW_MS = 600;             // ventana donde ignoramos transiciones intermedias del player
+// settleUntil: ventana de asentamiento. Mientras este abierta, los rebotes del
+// IFrame Player (BUFFERING/PLAYING/PAUSED) se descartan en onPlayerStateChange
+// para no generar autosync de un cambio que nosotros mismos disparamos.
+let settleUntil = 0;
+const SETTLE_WINDOW_MS = 600;
+let lastSentPlaybackTime = 0;
 
 const els = {};
 
@@ -115,22 +110,17 @@ function extractVideoId(input) {
   input = input.trim();
   if (!input) return null;
 
-  // ID puro (11 chars tipicamente, validos en YouTube)
   if (/^[A-Za-z0-9_-]{11}$/.test(input)) return input;
 
-  // youtu.be/<id>
   const yMatch = input.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
   if (yMatch) return yMatch[1];
 
-  // youtube.com/watch?v=<id>
   const vMatch = input.match(/[?&]v=([A-Za-z0-9_-]{11})/);
   if (vMatch) return vMatch[1];
 
-  // youtube.com/shorts/<id>
   const sMatch = input.match(/\/shorts\/([A-Za-z0-9_-]{11})/);
   if (sMatch) return sMatch[1];
 
-  // youtube.com/embed/<id>
   const eMatch = input.match(/\/embed\/([A-Za-z0-9_-]{11})/);
   if (eMatch) return eMatch[1];
 
@@ -138,7 +128,6 @@ function extractVideoId(input) {
   return null;
 }
 
-// Detecta que tipo de input es. Retorna { kind: 'playlist' | 'video' | null, id }
 function classifyInput(input) {
   if (!input) return { kind: null, id: null };
   const pid = extractPlaylistId(input);
@@ -149,8 +138,6 @@ function classifyInput(input) {
 }
 
 function getPlaylistThumbnail(playlistId) {
-  // No tenemos API key para thumbnails reales de playlists.
-  // Devolvemos un SVG inline como placeholder (data URL) para evitar 404.
   const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 68'>` +
     `<rect width='120' height='68' fill='%2330303a'/>` +
     `<g fill='%23a0a0b0'>` +
@@ -410,304 +397,95 @@ function currentTargetTime(r) {
   return base + elapsed;
 }
 
-async function emitRoomState(playerState, extra) {
+// Emite un autosync del estado actual del player (playback_time + estado).
+// Usado SOLO por el timer periodico y por onPlayerStateChange para reflejar
+// cambios genuinos del IFrame Player (pausa por buffering, etc.).
+// Las acciones del usuario (botones) NO usan esta funcion: escriben directo
+// a Supabase con el patch exacto y dejan que renderRoomState aplique todo.
+async function emitRoomState(playerState) {
   if (!room || !Player.isReady()) return;
 
-  extra = extra || {};
   const nowIso = new Date().toISOString();
-  const nowMs = Date.now();
-  const callerStack = (new Error()).stack.split('\n').slice(2, 4).join(' | ');
   const finalState = playerState || Player.getStateName();
   const finalTime = Player.getCurrentTime();
-  // `isUserAction` indica que esto es una ACCION DIRECTA del usuario (boton play/pause/seek).
-  // Solo en ese caso actualizamos lastAppliedAt. Los heartbeats periodicos (stateTimer) y los
-  // emits automaticos NO son acciones del usuario, solo emiten para informar estado.
-  const isUserAction = extra && extra.__userAction === true;
-  if (isUserAction) delete extra.__userAction;
-
-  console.log('[SYNC][EMIT]', {
-    when: nowIso,
-    ms: nowMs,
-    caller: callerStack,
-    state: finalState,
-    clientId: CLIENT_ID,
-    videoId: Player.getVideoId(),
-    playbackTime: finalTime,
-    isUserAction: isUserAction,
-    extra: extra
-  });
 
   const patch = {
     playback_time: finalTime,
     player_state: finalState,
     current_video_id: Player.getVideoId(),
     client_id: CLIENT_ID,
-    updated_at: nowIso,
-    ...extra
+    updated_at: nowIso
   };
 
-  lastSentUpdatedAt = patch.updated_at;
-  lastSentClientId = CLIENT_ID;
-  lastSentPlaybackTime = patch.playback_time;
-  lastEmittedAt = nowMs;
-  if (isUserAction) {
-    lastAppliedAt = nowMs;
-  }
-
-  const { error } = await supabase.from('rooms').update(patch).eq('id', room.id);
-  if (error) {
-    if (!canControl) {
-      setStatus('No tenes permiso para controlar esta sala.');
-    } else {
-      console.warn('Error enviando estado:', error.message);
-    }
-  }
-}
-
-async function loadActiveItem() {
-  if (!room.current_video_id) return;
-  if (lastVideoId === room.current_video_id) return;
-  lastVideoId = room.current_video_id;
-
-  // Si la sala esta "playing", usamos loadVideo (que autoreproduce).
-  // Si esta "paused", usamos cueVideo (no autoreproduce, evita el bug
-  // del navegador de sonar solo al cargar).
-  if (room.player_state === 'playing') {
-    Player.loadVideo(room.current_video_id, room.playback_time || 0);
-    // Reintento explicito por si el navegador bloqueo el autoplay.
-    setTimeout(function () {
-      if (Player.isReady() && Player.getState() !== YT.PlayerState.PLAYING) {
-        Player.play();
-        showResumeIfBlocked();
-      }
-    }, 600);
-  } else {
-    Player.cueVideo(room.current_video_id, room.playback_time || 0);
-  }
-
-  updateNowPlaying();
-  updateProgress();
-}
-
-async function advanceQueue() {
-  const idx = (room.current_queue_index || 0) + 1;
-  const nextItem = queueCache[idx];
-
-  // Abrimos ventana de asentamiento para evitar eco de los rebotes del player.
-  settleUntil = Date.now() + SETTLE_WINDOW_MS;
-  suppressPlayerEvents(SETTLE_WINDOW_MS);
-
-  if (!nextItem) {
-    Player.stop();
-    // Actualizamos el estado local ANTES del await para que la UI refleje el
-    // cambio al instante. El sync que vuelva por Realtime sera DROP-ECHO.
-    room.current_video_id = null;
-    room.current_queue_index = 0;
-    room.playback_time = 0;
-    room.player_state = 'paused';
-    lastVideoId = null;
-    renderQueue();
-    updateNowPlaying();
-    updatePermissionsUI();
-    await supabase.from('rooms').update({
-      current_video_id: null,
-      current_queue_index: 0,
-      playback_time: 0,
-      player_state: 'paused',
-      client_id: CLIENT_ID,
-      updated_at: new Date().toISOString()
-    }).eq('id', room.id);
-    return;
-  }
-
-  Player.loadVideo(nextItem.video_id, 0);
-  Player.play();
-
-  // Actualizamos el estado local ANTES del await.
-  room.current_video_id = nextItem.video_id;
-  room.current_queue_index = idx;
-  room.playback_time = 0;
-  room.player_state = 'playing';
-  lastVideoId = nextItem.video_id;
-  renderQueue();
-  updateNowPlaying();
-  updatePermissionsUI();
-
-  await supabase.from('rooms').update({
-    current_video_id: nextItem.video_id,
-    current_queue_index: idx,
-    playback_time: 0,
-    player_state: 'playing',
-    client_id: CLIENT_ID,
-    updated_at: new Date().toISOString()
-  }).eq('id', room.id);
-}
-
-function applyRemoteState(newRoom) {
-  if (!room) return;
-  if (!Player.isReady()) {
-    // Sin player listo, solo sincronizamos metadata local sin actuar sobre el reproductor.
-    console.log('[SYNC][RECV][no-player]', {
-      state: newRoom.player_state,
-      updated_at: newRoom.updated_at,
-      lastAppliedAt: lastAppliedAt
-    });
-    syncRoomMetadata(newRoom);
-    return;
-  }
-
-  const remoteMs = newRoom.updated_at ? new Date(newRoom.updated_at).getTime() : 0;
-
-  // Eco: solo si el client_id del remitente coincide con el mio.
-  // Ya no usamos cercania de tiempo como criterio principal: si el otro
-  // participante actua casi al mismo tiempo, su evento es genuino y no debe
-  // descartarse solo por proximidad temporal.
-  const isEcho = newRoom.client_id && newRoom.client_id === CLIENT_ID;
-  if (isEcho) {
-    console.log('[SYNC][RECV][DROP-ECHO]', {
-      remoteState: newRoom.player_state,
-      remoteUpdatedAt: newRoom.updated_at,
-      remoteMs: remoteMs,
-      remoteClientId: newRoom.client_id,
-      lastAppliedAt: lastAppliedAt,
-      reason: 'same client_id'
-    });
-    return;
-  }
-
-  // Evento viejo: ya aplicamos algo mas reciente localmente (propio o remoto).
-  // Comparamos contra lastAppliedAt (en ms). Tolerancia chica para no descartar
-  // eventos del mismo instante por drift de reloj.
-  if (remoteMs && remoteMs + REMOTE_STATE_GRACE_MS < lastAppliedAt) {
-    console.log('[SYNC][RECV][DROP-STALE]', {
-      remoteState: newRoom.player_state,
-      remoteUpdatedAt: newRoom.updated_at,
-      remoteMs: remoteMs,
-      lastAppliedAt: lastAppliedAt,
-      lastEmittedAt: lastEmittedAt,
-      diff: lastAppliedAt - remoteMs
-    });
-    return;
-  }
-
-  console.log('[SYNC][RECV][APPLY]', {
-    remoteState: newRoom.player_state,
-    remoteUpdatedAt: newRoom.updated_at,
-    remoteMs: remoteMs,
-    remoteClientId: newRoom.client_id,
-    lastAppliedAt: lastAppliedAt,
-    currentPlayerState: Player.getState(),
-    applyingRemote: applyingRemote
+  lastSentPlaybackTime = finalTime;
+  console.log('[SYNC][EMIT]', {
+    state: finalState,
+    videoId: Player.getVideoId(),
+    playbackTime: finalTime
   });
 
-  applyingRemote = true;
-  try {
-    syncRoomMetadata(newRoom);
-    lastAppliedAt = Math.max(lastAppliedAt, remoteMs || Date.now());
-
-    suppressPlayerEvents(1200);
-
-    if (newRoom.current_video_id) {
-      loadActiveItem();
-    } else {
-      Player.stop();
-      updateProgress();
-      return;
-    }
-
-    const targetTime = currentTargetTime(newRoom);
-    const currentVideo = Player.getVideoId();
-    const remoteVideo = newRoom.current_video_id;
-
-    if (remoteVideo && currentVideo && currentVideo !== remoteVideo) {
-      Player.loadVideo(remoteVideo, targetTime);
-    }
-
-    const diff = Math.abs(Player.getCurrentTime() - targetTime);
-    if (diff > 2) {
-      Player.seekTo(targetTime, true);
-    }
-
-    const state = Player.getState();
-    if (newRoom.player_state === 'playing' && state !== YT.PlayerState.PLAYING) {
-      Player.play();
-    } else if (newRoom.player_state === 'paused' && state === YT.PlayerState.PLAYING) {
-      Player.pause();
-    }
-  } finally {
-    // Mantenemos applyingRemote hasta que termine la ventana de asentamiento
-    // para que los rebotes intermedios del IFrame Player (BUFFERING/PLAYING/PAUSED)
-    // NO generen eco.
-    settleUntil = Date.now() + SETTLE_WINDOW_MS;
-    scheduleSettleCheck();
-  }
-
-  updateNowPlaying();
-  updateProgress();
+  const { error } = await supabase.from('rooms').update(patch).eq('id', room.id);
+  if (error) console.warn('Error enviando estado:', error.message);
 }
 
-// Despues de aplicar un estado remoto, esperamos a que el player se asiente.
-// Si al final de la ventana el estado del player coincide con el aplicado, no emitimos.
-// Si quedo en un estado distinto al que mandaron, emitimos ese estado "firme".
-function scheduleSettleCheck() {
-  if (settleTimer) clearTimeout(settleTimer);
-  settleTimer = setTimeout(function () {
-    settleTimer = null;
-    applyingRemote = false;
-    settleUntil = 0;
+// =====================================================================
+// renderRoomState(newRoom): UNICO punto de aplicacion del estado.
+//
+// Recibe SIEMPRE el estado completo de la sala (de Realtime o de un reload
+// manual). Actualiza el objeto room en memoria, refresca la UI y aplica
+// los cambios al reproductor. No distingue si el cambio es propio o
+// remoto: el mismo camino se usa en ambos casos.
+// =====================================================================
+function renderRoomState(newRoom) {
+  if (!room || !newRoom) return;
 
-    if (!Player.isReady() || !room) return;
+  const targetTime = currentTargetTime(newRoom);
+  const videoChanged = newRoom.current_video_id !== room.current_video_id;
+  const stateChanged = newRoom.player_state !== room.player_state;
 
-    const s = Player.getState();
-    const playerStateName =
-      s === YT.PlayerState.PLAYING ? 'playing' :
-      s === YT.PlayerState.PAUSED ? 'paused' :
-      s === YT.PlayerState.ENDED ? 'ended' :
-      null;
+  console.log('[SYNC][RENDER]', {
+    videoChanged: videoChanged,
+    stateChanged: stateChanged,
+    targetState: newRoom.player_state,
+    targetVideoId: newRoom.current_video_id,
+    targetTime: targetTime
+  });
 
-    // La fuente de verdad es SIEMPRE room.player_state (lo que el remoto acaba de establecer).
-    // El player local puede estar en transicion/buffering; lo que nunca debemos hacer es
-    // pisar el estado remoto emitiendo un nuevo valor.
-    const targetState = room.player_state;
+  // 1) Actualizar el objeto room (single source of truth).
+  Object.assign(room, newRoom);
 
-    console.log('[SYNC][SETTLE]', {
-      finalPlayerState: playerStateName,
-      remoteState: targetState,
-      match: playerStateName === targetState
-    });
-
-    // Si el player quedo en un estado distinto al que se aplico (porque estaba en buffering
-    // o transicion), forzamos al player local a igualar el estado remoto. NUNCA emitimos
-    // a la base de datos para "corregir" el remoto con el estado local.
-    if (playerStateName && targetState && playerStateName !== targetState) {
-      console.log('[SYNC][SETTLE][FORCE-LOCAL]', {
-        playerState: playerStateName,
-        targetState: targetState,
-        action: targetState === 'playing' ? 'Player.play()' : 'Player.pause()'
-      });
-      if (targetState === 'playing' && s !== YT.PlayerState.PLAYING) {
-        Player.play();
-      } else if (targetState === 'paused' && s !== YT.PlayerState.PAUSED) {
-        Player.pause();
-      }
-    }
-  }, SETTLE_WINDOW_MS);
-}
-
-// Aplica solo la metadata al objeto room local (sin tocar el reproductor).
-function syncRoomMetadata(newRoom) {
-  room.is_open = newRoom.is_open;
-  room.admin_id = newRoom.admin_id || room.admin_id;
-  room.current_video_id = newRoom.current_video_id;
-  room.current_queue_index = newRoom.current_queue_index;
-  room.playback_time = newRoom.playback_time;
-  room.player_state = newRoom.player_state;
-
-  isAdmin = room.admin_id === userId;
+  // 2) Refrescar UI inmediatamente.
   updateHasQueue();
   updatePermissionsUI();
   updateNowPlaying();
   renderQueue();
+
+  if (!Player.isReady()) return;
+
+  // 3) Aplicar al reproductor. Abrimos ventana de asentamiento para que los
+  // rebotes del IFrame Player no disparen autosync.
+  settleUntil = Date.now() + SETTLE_WINDOW_MS;
+  suppressPlayerEvents(SETTLE_WINDOW_MS);
+
+  if (videoChanged) {
+    if (newRoom.current_video_id === null) {
+      Player.stop();
+      lastVideoId = null;
+      updateProgress();
+    } else {
+      Player.loadVideo(newRoom.current_video_id, targetTime);
+      lastVideoId = newRoom.current_video_id;
+      if (newRoom.player_state === 'playing') Player.play();
+      else Player.pause();
+    }
+  } else {
+    const drift = Math.abs((Player.getCurrentTime() || 0) - targetTime);
+    if (drift > 1.5) Player.seekTo(targetTime, true);
+    if (stateChanged) {
+      if (newRoom.player_state === 'playing') Player.play();
+      else Player.pause();
+    }
+  }
 }
 
 function updateNowPlaying() {
@@ -728,7 +506,6 @@ function updateNowPlaying() {
 
   titleEl.textContent = title;
 
-  // Determinar estado real segun el player
   let stateLabel = '';
   if (Player.isReady()) {
     const s = Player.getState();
@@ -741,8 +518,6 @@ function updateNowPlaying() {
     } else if (s === YT.PlayerState.ENDED) {
       stateLabel = 'Finalizado';
     } else {
-      // -1 unstarted, 3 buffering, 5 cued: la sala dice playing pero
-      // el player no empezo -> probablemente bloqueo de autoplay.
       stateLabel = (room.player_state === 'playing') ? 'Listo para reproducir' : 'En pausa';
     }
   } else {
@@ -752,7 +527,6 @@ function updateNowPlaying() {
   statusEl.textContent = stateLabel;
   statusEl.classList.remove('hidden');
 
-  // Mostrar overlay si la sala deberia estar sonando pero no suena
   if (room.player_state === 'playing' && Player.isReady()) {
     const s = Player.getState();
     if (s !== YT.PlayerState.PLAYING && s !== YT.PlayerState.BUFFERING) {
@@ -808,56 +582,57 @@ function onPlayerStateChange(stateCode) {
     : stateCode === YT.PlayerState.CUED ? 'CUED'
     : 'UNSTARTED(-1)';
 
-  console.log('[SYNC][ONSTATE]', {
-    state: stateName,
-    stateCode: stateCode,
-    ignoringEvents: ignoringEvents(),
-    applyingRemote: applyingRemote,
-    settleUntil: settleUntil,
-    nowMs: Date.now(),
-    inSettleWindow: Date.now() < settleUntil
-  });
+  if (ignoringEvents()) {
+    updateNowPlaying();
+    return;
+  }
 
-  if (ignoringEvents()) return;
+  if (Date.now() < settleUntil) {
+    updateNowPlaying();
+    return;
+  }
 
   const name = stateCode === YT.PlayerState.PLAYING ? 'playing'
     : stateCode === YT.PlayerState.PAUSED ? 'paused'
     : stateCode === YT.PlayerState.ENDED ? 'ended'
     : null;
 
-  // Si estamos aplicando un sync remoto O dentro de la ventana de asentamiento,
-  // suprimimos TODAS las emisiones. El IFrame Player rebota BUFFERING/PLAYING/PAUSED
-  // al pausar/seekear; cualquier emision durante esa secuencia genera eco.
-  if (applyingRemote || Date.now() < settleUntil) {
-    console.log('[SYNC][ONSTATE][SUPPRESS]', {
-      reason: applyingRemote ? 'applyingRemote' : 'settleWindow',
-      state: stateName
-    });
+  // El admin es el unico que avanza la cola cuando un video termina.
+  // Lo hace escribiendo directo a la DB (renderRoomState se encarga de
+  // aplicar el cambio en TODOS los clientes, incluido este).
+  if (name === 'ended' && isAdmin) {
+    const idx = (room.current_queue_index || 0) + 1;
+    const nextItem = queueCache[idx];
+    const patch = nextItem
+      ? {
+          current_video_id: nextItem.video_id,
+          current_queue_index: idx,
+          playback_time: 0,
+          player_state: 'playing',
+          client_id: CLIENT_ID,
+          updated_at: new Date().toISOString()
+        }
+      : {
+          current_video_id: null,
+          current_queue_index: 0,
+          playback_time: 0,
+          player_state: 'paused',
+          client_id: CLIENT_ID,
+          updated_at: new Date().toISOString()
+        };
+    settleUntil = Date.now() + SETTLE_WINDOW_MS;
+    suppressPlayerEvents(SETTLE_WINDOW_MS);
+    supabase.from('rooms').update(patch).eq('id', room.id);
     updateNowPlaying();
     return;
   }
 
   if (name === 'playing' || name === 'paused') {
     if (name === 'paused') {
-      // Abrimos ventana corta para que cualquier rebote BUFFERING/PLAYING
-      // post-pause no reemita.
       settleUntil = Date.now() + SETTLE_WINDOW_MS;
     }
-    console.log('[SYNC][ONSTATE][EMIT-VIA]', { state: stateName });
-    // Si llegamos aca (no suprimido por settle/applyingRemote/ignoreEvents),
-    // el cambio es legitimo del usuario. Marcamos como userAction para que
-    // lastAppliedAt se actualice.
-    emitRoomState(name, { __userAction: true });
+    emitRoomState(name);
   }
-
-  // 'ended' lo maneja SOLO el admin para evitar carrera entre clientes
-  // que terminan su reproductor local casi al mismo tiempo.
-  if (name === 'ended' && isAdmin) {
-    console.log('[SYNC][ONSTATE][ADMIN-ADVANCE]');
-    advanceQueue();
-  }
-
-  if (!canControl) return;
 
   if (stateCode === YT.PlayerState.PLAYING && room) {
     if (!stateTimer) {
@@ -865,14 +640,7 @@ function onPlayerStateChange(stateCode) {
         if (!Player.isReady()) return;
         if (Player.getState() === YT.PlayerState.PLAYING) {
           const currentT = Player.getCurrentTime();
-          const drift = Math.abs(currentT - lastSentPlaybackTime);
-          console.log('[SYNC][STATE-TIMER]', {
-            drift: drift,
-            willEmit: drift > 2,
-            currentT: currentT,
-            lastSentPlaybackTime: lastSentPlaybackTime
-          });
-          if (drift > 2) {
+          if (Math.abs(currentT - lastSentPlaybackTime) > 2) {
             emitRoomState('playing');
           }
         }
@@ -894,7 +662,7 @@ function setupRealtime() {
       'postgres_changes',
       { event: 'UPDATE', schema: 'public', table: 'rooms', filter: 'id=eq.' + room.id },
       function (payload) {
-        applyRemoteState(payload.new);
+        renderRoomState(payload.new);
       }
     )
     .on(
@@ -909,8 +677,7 @@ function setupRealtime() {
       { event: '*', schema: 'public', table: 'queue', filter: 'room_id=eq.' + room.id },
       function () {
         loadQueue().then(function () {
-          updateNowPlaying();
-          updatePermissionsUI();
+          renderRoomState(room);
         });
       }
     )
@@ -927,9 +694,8 @@ async function setupPlayer() {
     onReady: function () {
       setStatus('Reproductor listo.');
       if (room && room.current_video_id) {
-        loadActiveItem();
+        renderRoomState(room);
       }
-      // Aplicar volumen inicial
       if (currentVolume != null && Player.isReady()) {
         Player.setVolume(currentVolume);
       }
@@ -1032,17 +798,13 @@ async function addPlaylistToQueue(playlistId, playlistName) {
     return;
   }
 
-  // Si no hay nada sonando, arrancar con el primer video de la playlist.
+  await loadQueue();
+
   if (!room.current_video_id) {
     await startQueueAt(startPos, rows[0]);
   } else {
     setStatus('Playlist agregada.');
   }
-
-  await loadQueue();
-  updateHasQueue();
-  updateNowPlaying();
-  updatePermissionsUI();
 }
 
 async function addSingleVideoToQueue(videoId) {
@@ -1080,16 +842,13 @@ async function addSingleVideoToQueue(videoId) {
     return;
   }
 
+  await loadQueue();
+
   if (!room.current_video_id) {
     await startQueueAt(startPos, row);
   } else {
     setStatus('Video agregado a la cola.');
   }
-
-  await loadQueue();
-  updateHasQueue();
-  updateNowPlaying();
-  updatePermissionsUI();
 }
 
 async function getNextPosition() {
@@ -1101,23 +860,11 @@ async function getNextPosition() {
   return data || 1;
 }
 
+// Arranca la cola con el primer item cuando la sala estaba vacia.
+// FASE 1: solo escribe a Supabase. renderRoomState (Fase 3) se encarga
+// de aplicar el cambio en TODOS los clientes via Realtime.
 async function startQueueAt(position, firstRow) {
-  const idx = queueCache.length; // sera el primer item nuevo
-  // Abrimos ventana de asentamiento ANTES de tocar el player.
-  settleUntil = Date.now() + SETTLE_WINDOW_MS;
-  suppressPlayerEvents(SETTLE_WINDOW_MS);
-  Player.loadVideo(firstRow.video_id, 0);
-  Player.play();
-  // Actualizamos el estado local ANTES del await. El sync que vuelva por
-  // Realtime sera DROP-ECHO por client_id.
-  room.current_video_id = firstRow.video_id;
-  room.current_queue_index = idx;
-  room.playback_time = 0;
-  room.player_state = 'playing';
-  lastVideoId = firstRow.video_id;
-  renderQueue();
-  updateNowPlaying();
-  updatePermissionsUI();
+  const idx = queueCache.length;
   await supabase.from('rooms').update({
     current_video_id: firstRow.video_id,
     current_queue_index: idx,
@@ -1168,6 +915,16 @@ function applyTheme() {
   }
 }
 
+// Patch utilitario para emitir un cambio a rooms. Usado por todos los handlers
+// (Fase 1). Solo escribe a Supabase; el resto lo hace renderRoomState.
+function patchRoom(patch) {
+  return supabase.from('rooms').update({
+    client_id: CLIENT_ID,
+    updated_at: new Date().toISOString(),
+    ...patch
+  }).eq('id', room.id);
+}
+
 function bindUI() {
   updatePermissionsUI();
 
@@ -1177,8 +934,6 @@ function bindUI() {
       Player.unMute && Player.unMute();
       Player.play();
       hideResume();
-      // Si el play fue bloqueado por el browser, YT va a tirar un error
-      // que se refleja en onError; el overlay reaparece via showResumeIfBlocked.
     };
     els.resumeOverlay.addEventListener('click', resume);
     els.resumeOverlay.addEventListener('keydown', function (e) {
@@ -1218,19 +973,31 @@ function bindUI() {
     });
   }
 
+  // ============ FASE 1: HANDLERS DE CONTROL ============
+  // Cada handler hace UNA sola cosa: escribir a Supabase. Sin Player.*,
+  // sin tocar room, sin refrescar UI. renderRoomState (Fase 3) hace el resto.
+
   if (els.playBtn) {
     els.playBtn.addEventListener('click', function () {
       if (!canControl || !hasQueue) return;
-      emitRoomState('playing', { __userAction: true });
-      Player.play();
+      if (!Player.isReady() || !room.current_video_id) return;
+      patchRoom({
+        player_state: 'playing',
+        playback_time: Player.getCurrentTime(),
+        current_video_id: Player.getVideoId()
+      });
     });
   }
 
   if (els.pauseBtn) {
     els.pauseBtn.addEventListener('click', function () {
       if (!canControl || !hasQueue) return;
-      emitRoomState('paused', { __userAction: true });
-      Player.pause();
+      if (!Player.isReady() || !room.current_video_id) return;
+      patchRoom({
+        player_state: 'paused',
+        playback_time: Player.getCurrentTime(),
+        current_video_id: Player.getVideoId()
+      });
     });
   }
 
@@ -1240,31 +1007,12 @@ function bindUI() {
       const idx = (room.current_queue_index || 0) - 1;
       const target = queueCache[idx];
       if (!target) return;
-      // Abrimos ventana de asentamiento ANTES de tocar el player, para que
-      // los onStateChange que genere no disparen emitRoomState y el sync que
-      // vuelva por Realtime sea DROP-ECHO.
-      settleUntil = Date.now() + SETTLE_WINDOW_MS;
-      suppressPlayerEvents(SETTLE_WINDOW_MS);
-      Player.loadVideo(target.video_id, 0);
-      Player.play();
-      // Actualizamos el estado local de inmediato (sin esperar al await).
-      room.current_video_id = target.video_id;
-      room.current_queue_index = idx;
-      room.playback_time = 0;
-      room.player_state = 'playing';
-      lastVideoId = target.video_id;
-      renderQueue();
-      updateNowPlaying();
-      updatePermissionsUI();
-      // Escribimos a DB con client_id para que el receptor sepa que es nuestro.
-      supabase.from('rooms').update({
+      patchRoom({
         current_video_id: target.video_id,
         current_queue_index: idx,
         playback_time: 0,
-        player_state: 'playing',
-        client_id: CLIENT_ID,
-        updated_at: new Date().toISOString()
-      }).eq('id', room.id);
+        player_state: 'playing'
+      });
     });
   }
 
@@ -1274,27 +1022,12 @@ function bindUI() {
       const idx = (room.current_queue_index || 0) + 1;
       const target = queueCache[idx];
       if (!target) return;
-      settleUntil = Date.now() + SETTLE_WINDOW_MS;
-      suppressPlayerEvents(SETTLE_WINDOW_MS);
-      Player.loadVideo(target.video_id, 0);
-      Player.play();
-      // Actualizamos el estado local de inmediato.
-      room.current_video_id = target.video_id;
-      room.current_queue_index = idx;
-      room.playback_time = 0;
-      room.player_state = 'playing';
-      lastVideoId = target.video_id;
-      renderQueue();
-      updateNowPlaying();
-      updatePermissionsUI();
-      supabase.from('rooms').update({
+      patchRoom({
         current_video_id: target.video_id,
         current_queue_index: idx,
         playback_time: 0,
-        player_state: 'playing',
-        client_id: CLIENT_ID,
-        updated_at: new Date().toISOString()
-      }).eq('id', room.id);
+        player_state: 'playing'
+      });
     });
   }
 
@@ -1309,20 +1042,16 @@ function bindUI() {
   }
 
   if (els.progress) {
-    let seeking = false;
     els.progress.addEventListener('input', function () {
-      seeking = true;
       if (els.progressCurrent) els.progressCurrent.textContent = formatTime(els.progress.value);
     });
     els.progress.addEventListener('change', function () {
-      seeking = false;
       if (!canControl || !hasQueue) return;
       const seconds = Number(els.progress.value);
-      Player.seekTo(seconds, true);
-      emitRoomState(Player.getStateName(), {
+      if (!Player.isReady() || !room.current_video_id) return;
+      patchRoom({
         current_video_id: Player.getVideoId(),
-        playback_time: seconds,
-        __userAction: true
+        playback_time: seconds
       });
     });
   }
@@ -1330,7 +1059,7 @@ function bindUI() {
   if (els.syncBtn) {
     els.syncBtn.addEventListener('click', function () {
       Promise.all([loadRoom(), loadQueue()]).then(function () {
-        applyRemoteState(room);
+        renderRoomState(room);
       });
     });
   }
