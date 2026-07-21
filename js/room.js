@@ -26,7 +26,8 @@ let themeIsDark = false;
 let currentVolume = 100;
 
 // === Sync / state control ===
-let lastAppliedAt = 0;            // timestamp (ms) del ultimo estado aplicado localmente (propio o remoto)
+let lastAppliedAt = 0;            // timestamp (ms) del ultimo estado que el player local aplico (REMOTO o ACCION DE USUARIO). NO se actualiza por heartbeats.
+let lastEmittedAt = 0;            // timestamp (ms) del ultimo estado que mande a DB (incluye heartbeats)
 let lastSentPlaybackTime = 0;     // ultimo playback_time que mande a DB
 let lastSentClientId = null;      // ultimo client_id que mande a DB (para deteccion de eco)
 let applyingRemote = false;       // true mientras aplicamos un sync remoto (evita eco)
@@ -408,6 +409,12 @@ async function emitRoomState(playerState, extra) {
   const callerStack = (new Error()).stack.split('\n').slice(2, 4).join(' | ');
   const finalState = playerState || Player.getStateName();
   const finalTime = Player.getCurrentTime();
+  // `isUserAction` indica que esto es una ACCION DIRECTA del usuario (boton play/pause/seek).
+  // Solo en ese caso actualizamos lastAppliedAt. Los heartbeats periodicos (stateTimer) y los
+  // emits automaticos NO son acciones del usuario, solo emiten para informar estado.
+  const isUserAction = extra && extra.__userAction === true;
+  if (isUserAction) delete extra.__userAction;
+
   console.log('[SYNC][EMIT]', {
     when: nowIso,
     ms: nowMs,
@@ -416,6 +423,7 @@ async function emitRoomState(playerState, extra) {
     clientId: CLIENT_ID,
     videoId: Player.getVideoId(),
     playbackTime: finalTime,
+    isUserAction: isUserAction,
     extra: extra
   });
 
@@ -431,7 +439,10 @@ async function emitRoomState(playerState, extra) {
   lastSentUpdatedAt = patch.updated_at;
   lastSentClientId = CLIENT_ID;
   lastSentPlaybackTime = patch.playback_time;
-  lastAppliedAt = nowMs;
+  lastEmittedAt = nowMs;
+  if (isUserAction) {
+    lastAppliedAt = nowMs;
+  }
 
   const { error } = await supabase.from('rooms').update(patch).eq('id', room.id);
   if (error) {
@@ -537,6 +548,7 @@ function applyRemoteState(newRoom) {
       remoteUpdatedAt: newRoom.updated_at,
       remoteMs: remoteMs,
       lastAppliedAt: lastAppliedAt,
+      lastEmittedAt: lastEmittedAt,
       diff: lastAppliedAt - remoteMs
     });
     return;
@@ -788,7 +800,10 @@ function onPlayerStateChange(stateCode) {
       settleUntil = Date.now() + SETTLE_WINDOW_MS;
     }
     console.log('[SYNC][ONSTATE][EMIT-VIA]', { state: stateName });
-    emitRoomState(name);
+    // Si llegamos aca (no suprimido por settle/applyingRemote/ignoreEvents),
+    // el cambio es legitimo del usuario. Marcamos como userAction para que
+    // lastAppliedAt se actualice.
+    emitRoomState(name, { __userAction: true });
   }
 
   if (name === 'ended' && canControl) {
@@ -1228,7 +1243,8 @@ function bindUI() {
       Player.seekTo(seconds, true);
       emitRoomState(Player.getStateName(), {
         current_video_id: Player.getVideoId(),
-        playback_time: seconds
+        playback_time: seconds,
+        __userAction: true
       });
     });
   }
