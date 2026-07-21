@@ -18,6 +18,14 @@ let participantsCache = {};
 let themeIsDark = false;
 let currentVolume = 100;
 
+// === Sync / state control ===
+let lastAppliedAt = 0;            // timestamp (ms) del ultimo estado aplicado localmente (propio o remoto)
+let lastSentPlaybackTime = 0;     // ultimo playback_time que mande a DB
+let applyingRemote = false;       // true mientras aplicamos un sync remoto (evita eco)
+let suppressPlayUntil = 0;        // timestamp hasta el cual ignoramos PLAYING espontaneos
+const REMOTE_STATE_GRACE_MS = 100;   // tolerancia para syncs que llegan casi al mismo tiempo
+const SUPPRESS_PLAY_AFTER_PAUSE_MS = 5000;  // ventana donde ignoramos PLAYING post-pause
+
 const els = {};
 
 const YT_THUMB_BASE = 'https://img.youtube.com/vi';
@@ -386,15 +394,20 @@ async function emitRoomState(playerState, extra) {
   if (!room || !Player.isReady()) return;
 
   extra = extra || {};
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
   const patch = {
     playback_time: Player.getCurrentTime(),
     player_state: playerState || Player.getStateName(),
     current_video_id: Player.getVideoId(),
-    updated_at: new Date().toISOString(),
+    updated_at: nowIso,
     ...extra
   };
 
   lastSentUpdatedAt = patch.updated_at;
+  lastSentPlaybackTime = patch.playback_time;
+  lastAppliedAt = nowMs;
+
   const { error } = await supabase.from('rooms').update(patch).eq('id', room.id);
   if (error) {
     if (!canControl) {
@@ -459,11 +472,74 @@ async function advanceQueue() {
 }
 
 function applyRemoteState(newRoom) {
-  if (!room || !Player.isReady()) return;
+  if (!room) return;
+  if (!Player.isReady()) {
+    // Sin player listo, solo sincronizamos metadata local sin actuar sobre el reproductor.
+    syncRoomMetadata(newRoom);
+    return;
+  }
 
+  const remoteMs = newRoom.updated_at ? new Date(newRoom.updated_at).getTime() : 0;
+
+  // Eco: si lo mandamos nosotros hace poco, ignorar (ventana chica).
   const isEcho = lastSentUpdatedAt && newRoom.updated_at &&
-    Math.abs(new Date(newRoom.updated_at).getTime() - new Date(lastSentUpdatedAt).getTime()) < 1000;
+    Math.abs(remoteMs - new Date(lastSentUpdatedAt).getTime()) < 250;
+  if (isEcho) return;
 
+  // Evento viejo: ya aplicamos algo mas reciente localmente (propio o remoto).
+  // Comparamos contra lastAppliedAt (en ms). Tolerancia chica para no descartar
+  // eventos del mismo instante por drift de reloj.
+  if (remoteMs && remoteMs + REMOTE_STATE_GRACE_MS < lastAppliedAt) {
+    // Sync obsoleto: lo descartamos silenciosamente.
+    return;
+  }
+
+  applyingRemote = true;
+  try {
+    syncRoomMetadata(newRoom);
+    lastAppliedAt = Math.max(lastAppliedAt, remoteMs || Date.now());
+
+    suppressPlayerEvents(1200);
+
+    if (newRoom.current_video_id) {
+      loadActiveItem();
+    } else {
+      Player.stop();
+      updateProgress();
+      return;
+    }
+
+    const targetTime = currentTargetTime(newRoom);
+    const currentVideo = Player.getVideoId();
+    const remoteVideo = newRoom.current_video_id;
+
+    if (remoteVideo && currentVideo && currentVideo !== remoteVideo) {
+      Player.loadVideo(remoteVideo, targetTime);
+    }
+
+    const diff = Math.abs(Player.getCurrentTime() - targetTime);
+    if (diff > 2) {
+      Player.seekTo(targetTime, true);
+    }
+
+    const state = Player.getState();
+    if (newRoom.player_state === 'playing' && state !== YT.PlayerState.PLAYING) {
+      Player.play();
+    } else if (newRoom.player_state === 'paused' && state === YT.PlayerState.PLAYING) {
+      Player.pause();
+      // Ventana de proteccion contra autoresume del player remoto.
+      suppressPlayUntil = Date.now() + SUPPRESS_PLAY_AFTER_PAUSE_MS;
+    }
+  } finally {
+    applyingRemote = false;
+  }
+
+  updateNowPlaying();
+  updateProgress();
+}
+
+// Aplica solo la metadata al objeto room local (sin tocar el reproductor).
+function syncRoomMetadata(newRoom) {
   room.is_open = newRoom.is_open;
   room.admin_id = newRoom.admin_id || room.admin_id;
   room.current_video_id = newRoom.current_video_id;
@@ -476,41 +552,6 @@ function applyRemoteState(newRoom) {
   updatePermissionsUI();
   updateNowPlaying();
   renderQueue();
-
-  if (isEcho) return;
-
-  suppressPlayerEvents(1200);
-
-  if (newRoom.current_video_id) {
-    loadActiveItem();
-  } else {
-    Player.stop();
-    updateProgress();
-    return;
-  }
-
-  const targetTime = currentTargetTime(newRoom);
-  const currentVideo = Player.getVideoId();
-  const remoteVideo = newRoom.current_video_id;
-
-  if (remoteVideo && currentVideo && currentVideo !== remoteVideo) {
-    Player.loadVideo(remoteVideo, targetTime);
-  }
-
-  const diff = Math.abs(Player.getCurrentTime() - targetTime);
-  if (diff > 2) {
-    Player.seekTo(targetTime, true);
-  }
-
-  const state = Player.getState();
-  if (newRoom.player_state === 'playing' && state !== YT.PlayerState.PLAYING) {
-    Player.play();
-  } else if (newRoom.player_state === 'paused' && state === YT.PlayerState.PLAYING) {
-    Player.pause();
-  }
-
-  updateNowPlaying();
-  updateProgress();
 }
 
 function updateNowPlaying() {
@@ -611,7 +652,32 @@ function onPlayerStateChange(stateCode) {
     : stateCode === YT.PlayerState.ENDED ? 'ended'
     : null;
 
+  // Si estamos aplicando un sync remoto, los onStateChange que dispara el
+  // Player.play()/pause() NO deben generar eco.
+  if (applyingRemote) {
+    if (name === 'ended' && canControl) {
+      advanceQueue();
+    }
+    updateNowPlaying();
+    return;
+  }
+
+  // Suprimir PLAYING espontaneos: si acabamos de pausar (propio o remoto) y
+  // YouTube se autorreanuda (típico tras buffering o seek), lo silenciamos
+  // durante una ventana corta para no pisar el pause.
+  if (stateCode === YT.PlayerState.PLAYING && Date.now() < suppressPlayUntil) {
+    if (Player.isReady()) {
+      Player.pause();
+    }
+    updateNowPlaying();
+    return;
+  }
+
   if (name === 'playing' || name === 'paused') {
+    if (name === 'paused') {
+      // Apenas pausamos, abrimos la ventana donde rechazamos PLAYING espontaneo.
+      suppressPlayUntil = Date.now() + SUPPRESS_PLAY_AFTER_PAUSE_MS;
+    }
     emitRoomState(name);
   }
 
@@ -625,8 +691,15 @@ function onPlayerStateChange(stateCode) {
   if (stateCode === YT.PlayerState.PLAYING && room) {
     if (!stateTimer) {
       stateTimer = setInterval(function () {
+        if (!Player.isReady()) return;
         if (Player.getState() === YT.PlayerState.PLAYING) {
-          emitRoomState('playing');
+          // Solo emitimos si el playback_time se desvio mas de 2s del ultimo enviado,
+          // o si el estado remoto dice algo distinto. Esto reduce ruido y evita pisar
+          // un pause que el otro usuario acaba de hacer.
+          const currentT = Player.getCurrentTime();
+          if (Math.abs(currentT - lastSentPlaybackTime) > 2) {
+            emitRoomState('playing');
+          }
         }
       }, 4000);
     }
