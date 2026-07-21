@@ -499,6 +499,16 @@ async function advanceQueue() {
 
   if (!nextItem) {
     Player.stop();
+    // Actualizamos el estado local ANTES del await para que la UI refleje el
+    // cambio al instante. El sync que vuelva por Realtime sera DROP-ECHO.
+    room.current_video_id = null;
+    room.current_queue_index = 0;
+    room.playback_time = 0;
+    room.player_state = 'paused';
+    lastVideoId = null;
+    renderQueue();
+    updateNowPlaying();
+    updatePermissionsUI();
     await supabase.from('rooms').update({
       current_video_id: null,
       current_queue_index: 0,
@@ -512,6 +522,16 @@ async function advanceQueue() {
 
   Player.loadVideo(nextItem.video_id, 0);
   Player.play();
+
+  // Actualizamos el estado local ANTES del await.
+  room.current_video_id = nextItem.video_id;
+  room.current_queue_index = idx;
+  room.playback_time = 0;
+  room.player_state = 'playing';
+  lastVideoId = nextItem.video_id;
+  renderQueue();
+  updateNowPlaying();
+  updatePermissionsUI();
 
   await supabase.from('rooms').update({
     current_video_id: nextItem.video_id,
@@ -1088,7 +1108,16 @@ async function startQueueAt(position, firstRow) {
   suppressPlayerEvents(SETTLE_WINDOW_MS);
   Player.loadVideo(firstRow.video_id, 0);
   Player.play();
-  // Escribimos a DB con client_id (el sync que vuelva sera DROP-ECHO).
+  // Actualizamos el estado local ANTES del await. El sync que vuelva por
+  // Realtime sera DROP-ECHO por client_id.
+  room.current_video_id = firstRow.video_id;
+  room.current_queue_index = idx;
+  room.playback_time = 0;
+  room.player_state = 'playing';
+  lastVideoId = firstRow.video_id;
+  renderQueue();
+  updateNowPlaying();
+  updatePermissionsUI();
   await supabase.from('rooms').update({
     current_video_id: firstRow.video_id,
     current_queue_index: idx,
@@ -1218,6 +1247,15 @@ function bindUI() {
       suppressPlayerEvents(SETTLE_WINDOW_MS);
       Player.loadVideo(target.video_id, 0);
       Player.play();
+      // Actualizamos el estado local de inmediato (sin esperar al await).
+      room.current_video_id = target.video_id;
+      room.current_queue_index = idx;
+      room.playback_time = 0;
+      room.player_state = 'playing';
+      lastVideoId = target.video_id;
+      renderQueue();
+      updateNowPlaying();
+      updatePermissionsUI();
       // Escribimos a DB con client_id para que el receptor sepa que es nuestro.
       supabase.from('rooms').update({
         current_video_id: target.video_id,
@@ -1240,6 +1278,15 @@ function bindUI() {
       suppressPlayerEvents(SETTLE_WINDOW_MS);
       Player.loadVideo(target.video_id, 0);
       Player.play();
+      // Actualizamos el estado local de inmediato.
+      room.current_video_id = target.video_id;
+      room.current_queue_index = idx;
+      room.playback_time = 0;
+      room.player_state = 'playing';
+      lastVideoId = target.video_id;
+      renderQueue();
+      updateNowPlaying();
+      updatePermissionsUI();
       supabase.from('rooms').update({
         current_video_id: target.video_id,
         current_queue_index: idx,
